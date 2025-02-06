@@ -375,17 +375,7 @@ const FileViewer = () => {
                                         <Copy className="w-4 h-4" />
                                     )}
                                 </button>
-                                <button
-                                    onClick={toggleCompare}
-                                    className="p-1 rounded hover:opacity-80 transition-colors"
-                                    style={{
-                                        backgroundColor: isComparing ? themeColors.highlight : 'transparent',
-                                        color: isComparing ? themeColors.buttonText : themeColors.text
-                                    }}
-                                    title="Compare versions"
-                                >
-                                    <GitCompare className="w-4 h-4" />
-                                </button>
+                               
                             </div>
 
                             {isComparing && (
