@@ -1,6 +1,6 @@
 # Tauri Prompt Copy
  Tauri Prompt Copy
-![{02CBFF0C-84CF-4370-9762-ACB0BBD5EF51}](https://github.com/user-attachments/assets/cfebb197-8b52-4b5b-b202-6dabb7658802)
+![Untitled-2](https://github.com/user-attachments/assets/7c2526ea-38ed-4539-bf57-a3ed698f07ef)
 
 
 ## Installation
