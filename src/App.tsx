@@ -15,6 +15,8 @@ import { getAll } from '@tauri-apps/api/window';
 import { markHistorySuccess } from './components/FolderHistory';
 import { TabBar } from "./components/TabBar";
 import type { TabData } from "./components/TabBar";
+import { loadTheme, saveTheme } from "./utils/storage";
+
 const App = () => {
     const [activeView, setActiveView] = useState<'files' | 'checked'>('files');
     const [theme, setTheme] = useState<Theme>('solarized');
@@ -31,11 +33,20 @@ const App = () => {
     children?: FileInfo[];
     displayPath?: string;
 }
-
+    useEffect(() => {
+        const initTheme = async () => {
+            const savedTheme = await loadTheme();
+            if (savedTheme) {
+                setTheme(savedTheme);
+            }
+        };
+        initTheme();
+    }, []);
     useEffect(() => {
         const syncTheme = async () => {
             try {
                 await emit('theme-update', { theme });
+                await saveTheme(theme);
             } catch (error) {
                 console.error('Error syncing theme:', error);
             }

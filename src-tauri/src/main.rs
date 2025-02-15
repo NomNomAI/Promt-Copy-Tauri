@@ -15,7 +15,7 @@ use std::sync::Arc;
 // Constants
 const MAX_FILE_SIZE: u64 = 10 * 1024 * 1024; // 10MB limit
 const DEBOUNCE_TIME: u64 = 500; // 500ms debounce time
-const MAX_DEPTH: u32 = 3; // Reduced max depth
+const MAX_DEPTH: u32 = 6; // Reduced max depth
 const BATCH_SIZE: usize = 50; // Batch size for processing
 const CHUNK_SIZE: usize = 500 * 1024; // 500KB chunks for streaming
 const CLEANUP_INTERVAL: u64 = 300; // 5 minutes
@@ -368,10 +368,11 @@ async fn create_file_window(
     let app_handle = window.app_handle();
     
     let file_viewer = if let Some(file_viewer) = app_handle.get_window("file-viewer") {
+        // Clear existing content before setting new content
         file_viewer.emit("clear-content", ()).map_err(|e| e.to_string())?;
         file_viewer
     } else {
-        tauri::WindowBuilder::new(
+        let file_viewer = tauri::WindowBuilder::new(
             &app_handle,
             "file-viewer",
             tauri::WindowUrl::App("file-viewer.html".into())
@@ -383,7 +384,11 @@ async fn create_file_window(
         .transparent(true)
         .skip_taskbar(true)
         .build()
-        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())?;
+
+        // Give the window a moment to initialize
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        file_viewer
     };
 
     let main_position = window.outer_position().map_err(|e| e.to_string())?;
@@ -399,9 +404,16 @@ async fn create_file_window(
         height: main_size.height,
     })).map_err(|e| e.to_string())?;
 
-    file_viewer.show().map_err(|e| e.to_string())?;
-    
-    // Stream content in chunks if large
+    // Send the theme first
+    if let Some(theme) = &theme {
+        file_viewer.emit("theme-update", serde_json::json!({ "theme": theme }))
+            .map_err(|e| e.to_string())?;
+        
+        // Give the theme a moment to apply
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // Then set the content
     if content.len() > CHUNK_SIZE {
         for chunk in content.as_bytes().chunks(CHUNK_SIZE) {
             if let Ok(chunk_str) = String::from_utf8(chunk.to_vec()) {
@@ -421,6 +433,7 @@ async fn create_file_window(
         })).map_err(|e| e.to_string())?;
     }
 
+    file_viewer.show().map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -469,7 +482,13 @@ fn list_json_files_recursive(dir: &PathBuf, files: &mut Vec<String>) -> Result<(
 fn handle_window_event(event: &WindowEvent, window: &tauri::Window) -> Result<(), Box<dyn std::error::Error>> {
     match event {
         WindowEvent::CloseRequested { api, .. } => {
-            if window.label() == "file-viewer" {
+            if window.label() == "main" {
+                // When main window is closed, close file viewer if it exists
+                let app_handle = window.app_handle();
+                if let Some(file_viewer) = app_handle.get_window("file-viewer") {
+                    file_viewer.close()?;
+                }
+            } else if window.label() == "file-viewer" {
                 window.emit_all("file-viewer-closed", ())?;
                 window.hide()?;
                 api.prevent_close();
@@ -542,6 +561,17 @@ fn main() {
             if let Err(e) = handle_window_event(event.event(), event.window()) {
                 eprintln!("Error handling window event: {:?}", e);
             }
+        })
+        .setup(|app| {
+            // Add a handler for when the main window is destroyed
+            let main_window = app.get_window("main").unwrap();
+            main_window.on_window_event(move |event| {
+                if let WindowEvent::Destroyed = event {
+                    // Ensure application exits completely when main window is destroyed
+                    std::process::exit(0);
+                }
+            });
+            Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             select_folder,

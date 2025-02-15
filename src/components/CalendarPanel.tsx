@@ -1,9 +1,10 @@
 import React, { useState, useEffect, useContext } from 'react';
-import { X, Trash2, CheckCircle, ChevronLeft, ChevronRight } from 'lucide-react';
+import { X, ChevronLeft, ChevronRight } from 'lucide-react';
 import { invoke } from "@tauri-apps/api/tauri";
 import { getAll } from '@tauri-apps/api/window';
 import { ThemeContext } from '../ThemeContext';
 import { listen } from '@tauri-apps/api/event';
+import CalendarListItem from './CalendarListItem';
 
 interface CalendarPanelProps {
     themeColors: any;
@@ -280,6 +281,48 @@ const CalendarPanel: React.FC<CalendarPanelProps> = ({ themeColors, isOpen, onCl
         }
     };
 
+    const handleMarkSuccess = async (entry: HistoryEntry) => {
+        try {
+            const year = selectedDate.getFullYear();
+            const month = String(selectedDate.getMonth() + 1).padStart(2, '0');
+            const day = String(selectedDate.getDate()).padStart(2, '0');
+            const filename = `${new Date(entry.timestamp).getTime()}.json`;
+            const path = `prompt-copy/history/${year}/${month}/${day}/${filename}`;
+
+            // Read the current file content
+            const appDataDir = await invoke<string>('get_app_data_dir');
+            const fullPath = `${appDataDir}/${path}`;
+            const content = await invoke<string>('read_file', { path: fullPath });
+            const updatedContent = JSON.parse(content);
+
+            // Update the success flag
+            updatedContent.success = true;
+
+            // Write back the updated content
+            await invoke('write_history', {
+                path,
+                content: JSON.stringify(updatedContent, null, 2)
+            });
+
+            // Update local state
+            setHistoryEntries(prev =>
+                prev.map(e =>
+                    e.timestamp === entry.timestamp
+                        ? { ...e, success: true }
+                        : e
+                )
+            );
+        } catch (error) {
+            console.error('Error marking entry as success:', error);
+        }
+    };
+
+    const handleToggleShowFiles = (index: number) => {
+        setHistoryEntries(prev => prev.map((e, i) =>
+            i === index ? { ...e, showAllFiles: !e.showAllFiles } : e
+        ));
+    };
+
     const panelStyles = {
         position: 'fixed' as const,
         top: '2rem',
@@ -403,97 +446,21 @@ const CalendarPanel: React.FC<CalendarPanelProps> = ({ themeColors, isOpen, onCl
                                 </div>
                             ) : (
                                 <div className="space-y-1 p-1">
-                                    {historyEntries.map((entry, index) => {
-                                        const entryTimestamp = new Date(entry.timestamp).getTime().toString();
-                                        const isActive = activeEntryTimestamp === entryTimestamp;
-
-                                        return (
-                                            <div
-                                                key={index}
-                                                className={`p-3 rounded relative group cursor-pointer hover:opacity-80 ${isActive ? 'history-entry-active' : ''}`}
-                                                style={{
-                                                    backgroundColor: themeColors.inputBg,
-                                                    border: `1px solid ${themeColors.border}`,
-                                                    color: themeColors.text
-                                                }}
-                                                onClick={() => handleViewEntry(entry)}
-                                            >
-                                                <div className="flex justify-between items-start">
-                                                    <div className="flex items-center gap-2">
-                                                        <div className="text-sm opacity-70 mb-2">
-                                                            {new Date(entry.timestamp).toLocaleTimeString()}
-                                                        </div>
-                                                        {entry.success && (
-                                                            <div
-                                                                className="flex items-center gap-1 text-xs px-2 py-0.5 rounded"
-                                                                style={{
-                                                                    backgroundColor: themeColors.highlight,
-                                                                    color: themeColors.buttonText
-                                                                }}
-                                                            >
-                                                                <CheckCircle className="w-3 h-3" />
-                                                                <span>Success</span>
-                                                            </div>
-                                                        )}
-                                                    </div>
-                                                    <button
-                                                        onClick={(e) => {
-                                                            e.stopPropagation();
-                                                            const year = selectedDate.getFullYear();
-                                                            const month = String(selectedDate.getMonth() + 1).padStart(2, '0');
-                                                            const day = String(selectedDate.getDate()).padStart(2, '0');
-                                                            const filename = `${new Date(entry.timestamp).getTime()}.json`;
-                                                            const path = `prompt-copy/history/${year}/${month}/${day}/${filename}`;
-                                                            handleDeleteEntry(path);
-                                                        }}
-                                                        className="opacity-0 group-hover:opacity-100 transition-opacity p-1 hover:bg-opacity-10 hover:bg-white rounded"
-                                                        style={{ color: themeColors.text }}
-                                                        disabled={isDeletingEntry !== null}
-                                                    >
-                                                        <Trash2 className="w-4 h-4" />
-                                                    </button>
-                                                </div>
-
-                                                {entry.prompt && (
-                                                    <div className="mb-2">
-                                                        <strong className="text-sm">Prompt:</strong>
-                                                        <div className="text-sm line-clamp-2 break-words">
-                                                            {entry.prompt}
-                                                        </div>
-                                                    </div>
-                                                )}
-
-                                                <div className="text-sm">
-                                                    <strong>Files:</strong> ({entry.files?.length || 0})
-                                                    <ul className="ml-4 mt-1">
-                                                        {Array.isArray(entry.files) && entry.files.slice(0, entry.showAllFiles ? undefined : 5).map((file: any, fileIndex: number) => (
-                                                            <li
-                                                                key={fileIndex}
-                                                                className="line-clamp-1 cursor-pointer hover:opacity-80 break-all"
-                                                                title={file?.path}
-                                                            >
-                                                                {file?.path ? file.path.split(/[/\\]/).pop() : 'Unknown file'}
-                                                            </li>
-                                                        ))}
-                                                    </ul>
-                                                    {Array.isArray(entry.files) && entry.files.length > 5 && (
-                                                        <button
-                                                            onClick={(e) => {
-                                                                e.stopPropagation();
-                                                                setHistoryEntries(prev => prev.map((e, i) =>
-                                                                    i === index ? { ...e, showAllFiles: !e.showAllFiles } : e
-                                                                ));
-                                                            }}
-                                                            className="mt-1 text-sm hover:opacity-80"
-                                                            style={{ color: themeColors.highlight }}
-                                                        >
-                                                            {entry.showAllFiles ? 'Show Less' : `Show ${entry.files.length - 5} More`}
-                                                        </button>
-                                                    )}
-                                                </div>
-                                            </div>
-                                        );
-                                    })}
+                                    {historyEntries.map((entry, index) => (
+                                        <CalendarListItem
+                                            key={entry.timestamp}
+                                            entry={entry}
+                                            index={index}
+                                            themeColors={themeColors}
+                                            activeEntryTimestamp={activeEntryTimestamp}
+                                            onViewEntry={handleViewEntry}
+                                            onDeleteEntry={handleDeleteEntry}
+                                            onMarkSuccess={handleMarkSuccess}
+                                            onToggleShowFiles={handleToggleShowFiles}
+                                            isDeletingEntry={isDeletingEntry}
+                                            selectedDate={selectedDate}
+                                        />
+                                    ))}
                                 </div>
                             )}
                         </div>
