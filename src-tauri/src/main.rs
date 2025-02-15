@@ -5,10 +5,15 @@
 
 use std::{fs, path::{Path, PathBuf}};
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tauri::{command, api::dialog, Manager, WindowEvent};
 use notify::{Watcher, RecursiveMode, Event};
+
+const MAX_FILE_SIZE: u64 = 10 * 1024 * 1024; // 10MB limit
+const DEBOUNCE_TIME: u64 = 100; // 100ms
+const MAX_WATCH_DEPTH: u32 = 5;
+const CHUNK_SIZE: usize = 1_000_000; // 1MB chunks for file streaming
 
 // Resize state management
 struct ResizeState {
@@ -35,9 +40,52 @@ struct FileInfo {
 
 struct FSWatcher(Mutex<Option<notify::RecommendedWatcher>>);
 
+struct MemoryMonitor {
+    last_cleanup: AtomicU64,
+    total_allocated: AtomicU64,
+}
+
+impl Default for MemoryMonitor {
+    fn default() -> Self {
+        Self {
+            last_cleanup: AtomicU64::new(0),
+            total_allocated: AtomicU64::new(0),
+        }
+    }
+}
+
+impl MemoryMonitor {
+    fn check_and_cleanup(&self) -> Result<(), String> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|e| e.to_string())?
+            .as_secs();
+        
+        let last = self.last_cleanup.load(Ordering::Relaxed);
+        if now - last > 300 { // Cleanup every 5 minutes
+            self.total_allocated.store(0, Ordering::Relaxed);
+            self.last_cleanup.store(now, Ordering::Relaxed);
+        }
+        Ok(())
+    }
+
+    fn allocate(&self, size: u64) -> Result<(), String> {
+        let current = self.total_allocated.load(Ordering::Relaxed);
+        if current + size > 1024 * 1024 * 1024 { // 1GB limit
+            return Err("Memory limit exceeded".to_string());
+        }
+        self.total_allocated.fetch_add(size, Ordering::Relaxed);
+        Ok(())
+    }
+}
+
 // File Reading and Directory Functions
 #[command]
 async fn read_file(path: String) -> Result<String, String> {
+    let metadata = fs::metadata(&path).map_err(|e| e.to_string())?;
+    if metadata.len() > MAX_FILE_SIZE {
+        return Err("File too large to read".to_string());
+    }
     fs::read_to_string(path).map_err(|e| e.to_string())
 }
 
@@ -51,10 +99,14 @@ async fn select_folder() -> Result<String, String> {
 
 #[command]
 fn list_files(path: String) -> Result<Vec<FileInfo>, String> {
-    read_dir_recursive(Path::new(&path))
+    read_dir_recursive(Path::new(&path), 0)
 }
 
-fn read_dir_recursive(path: &Path) -> Result<Vec<FileInfo>, String> {
+fn read_dir_recursive(path: &Path, depth: u32) -> Result<Vec<FileInfo>, String> {
+    if depth > MAX_WATCH_DEPTH {
+        return Ok(Vec::new());
+    }
+
     let entries = fs::read_dir(path).map_err(|e| e.to_string())?;
     let mut directories: Vec<FileInfo> = Vec::new();
     let mut files: Vec<FileInfo> = Vec::new();
@@ -72,7 +124,7 @@ fn read_dir_recursive(path: &Path) -> Result<Vec<FileInfo>, String> {
                 name,
                 path: path_buf.to_string_lossy().into_owned(),
                 is_directory: true,
-                children: Some(read_dir_recursive(&path_buf)?)
+                children: Some(read_dir_recursive(&path_buf, depth + 1)?)
             });
         } else {
             files.push(FileInfo {
@@ -161,6 +213,7 @@ async fn watch_directory(path: String, window: tauri::Window) -> Result<(), Stri
     let watcher_state = window.state::<FSWatcher>();
     let mut watcher = watcher_state.0.lock().map_err(|e| e.to_string())?;
 
+    // Clean up old watcher
     if watcher.is_some() {
         *watcher = None;
     }
@@ -175,12 +228,27 @@ async fn watch_directory(path: String, window: tauri::Window) -> Result<(), Stri
                     notify::EventKind::Remove(_) => "fs-deleted",
                     _ => return,
                 };
+                
+                // Debounce events
+                static LAST_EVENT: AtomicU64 = AtomicU64::new(0);
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis() as u64;
+                
+                let last = LAST_EVENT.load(Ordering::Relaxed);
+                if now - last < DEBOUNCE_TIME {
+                    return;
+                }
+                
+                LAST_EVENT.store(now, Ordering::Relaxed);
                 window_clone.emit(event_type, ()).ok();
             }
             Err(e) => eprintln!("Watch error: {:?}", e),
         }
     }).map_err(|e| e.to_string())?;
 
+    // Instead of using Config, we'll use watch() directly with RecursiveMode
     new_watcher.watch(path.as_ref(), RecursiveMode::Recursive)
         .map_err(|e| e.to_string())?;
 
@@ -198,7 +266,11 @@ async fn stop_watching(window: tauri::Window) -> Result<(), String> {
 
 // History Functions
 #[command]
-async fn write_history(path: String, content: String) -> Result<(), String> {
+async fn write_history(path: String, content: String, window: tauri::Window) -> Result<(), String> {
+    let memory_monitor = window.state::<MemoryMonitor>();
+    memory_monitor.check_and_cleanup()?;
+    memory_monitor.allocate(content.len() as u64)?;
+
     let app_dir = tauri::api::path::app_data_dir(&tauri::Config::default())
         .ok_or("Could not get app directory")?;
     let full_path = app_dir.join(path);
@@ -243,17 +315,23 @@ async fn create_file_window(
     title: String, 
     content: String, 
     theme: Option<String>
-) -> Result<(), String> {    
-    use std::time::Duration;
-    use tokio::time::sleep;
+) -> Result<(), String> {
+    let memory_monitor = window.state::<MemoryMonitor>();
+    memory_monitor.check_and_cleanup()?;
+    
+    if content.len() as u64 > MAX_FILE_SIZE {
+        return Err("File too large to display".to_string());
+    }
 
+    memory_monitor.allocate(content.len() as u64)?;
+    
     let app_handle = window.app_handle();
     
-    // Get or create file viewer window
     let file_viewer = if let Some(file_viewer) = app_handle.get_window("file-viewer") {
+        file_viewer.emit("clear-content", ()).map_err(|e| e.to_string())?;
         file_viewer
     } else {
-        let viewer = tauri::WindowBuilder::new(
+        tauri::WindowBuilder::new(
             &app_handle,
             "file-viewer",
             tauri::WindowUrl::App("file-viewer.html".into())
@@ -265,14 +343,9 @@ async fn create_file_window(
         .transparent(true)
         .skip_taskbar(true)
         .build()
-        .map_err(|e| e.to_string())?;
-
-        // Give the window a moment to initialize
-        sleep(Duration::from_millis(100)).await;
-        viewer
+        .map_err(|e| e.to_string())?
     };
 
-    // Position and size setup
     let main_window = window;
     let main_position = main_window.outer_position().map_err(|e| e.to_string())?;
     let main_size = main_window.outer_size().map_err(|e| e.to_string())?;
@@ -287,18 +360,25 @@ async fn create_file_window(
         height: main_size.height,
     })).map_err(|e| e.to_string())?;
 
-    // Show window first
     file_viewer.show().map_err(|e| e.to_string())?;
     
-    // Small delay to ensure window is ready
-    sleep(Duration::from_millis(50)).await;
-
-    // Now emit content with theme information
-    file_viewer.emit("set-content", serde_json::json!({
-        "content": content,
-        "filePath": title,
-        "theme": theme
-    })).map_err(|e| e.to_string())?;
+    if content.len() > CHUNK_SIZE {
+        for chunk in content.as_bytes().chunks(CHUNK_SIZE) {
+            if let Ok(chunk_str) = String::from_utf8(chunk.to_vec()) {
+                file_viewer.emit("append-content", serde_json::json!({
+                    "content": chunk_str,
+                    "filePath": &title,
+                    "theme": &theme
+                })).map_err(|e| e.to_string())?;
+            }
+        }
+    } else {
+        file_viewer.emit("set-content", serde_json::json!({
+            "content": content,
+            "filePath": title,
+            "theme": theme
+        })).map_err(|e| e.to_string())?;
+    }
 
     Ok(())
 }
@@ -308,8 +388,7 @@ async fn list_history_files(path: String) -> Result<Vec<String>, String> {
     let app_dir = tauri::api::path::app_data_dir(&tauri::Config::default())
         .ok_or("Could not get app directory")?;
     let dir_path = app_dir.join(path);
-    
-    if !dir_path.exists() {
+if !dir_path.exists() {
         return Ok(vec![]);
     }
 
@@ -334,83 +413,82 @@ fn list_json_files_recursive(dir: &PathBuf, files: &mut Vec<String>) -> Result<(
     Ok(())
 }
 
+fn handle_window_event(event: &WindowEvent, window: &tauri::Window) -> Result<(), Box<dyn std::error::Error>> {
+    match event {
+        WindowEvent::CloseRequested { api, .. } => {
+            if window.label() == "file-viewer" {
+                let app_handle = window.app_handle();
+                app_handle.emit_all("file-viewer-closed", ())?;
+                window.hide()?;
+                api.prevent_close();
+            }
+        }
+        WindowEvent::Focused(focused) => {
+            if *focused {
+                let app_handle = window.app_handle();
+                
+                if window.label() == "main" {
+                    if let Some(file_viewer) = app_handle.get_window("file-viewer") {
+                        if file_viewer.is_visible()? {
+                            window.set_always_on_top(true)?;
+                            file_viewer.set_always_on_top(true)?;
+                            file_viewer.unminimize()?;
+                            window.set_always_on_top(false)?;
+                            file_viewer.set_always_on_top(false)?;
+                        }
+                    }
+                } else if window.label() == "file-viewer" {
+                    if let Some(main_window) = app_handle.get_window("main") {
+                        window.set_always_on_top(true)?;
+                        main_window.set_always_on_top(true)?;
+                        main_window.unminimize()?;
+                        window.set_always_on_top(false)?;
+                        main_window.set_always_on_top(false)?;
+                    }
+                }
+            }
+        }
+        WindowEvent::Moved(position) => {
+            if window.label() == "main" {
+                let app_handle = window.app_handle();
+                if let Some(file_viewer) = app_handle.get_window("file-viewer") {
+                    if file_viewer.is_visible()? {
+                        if let Ok(main_size) = window.outer_size() {
+                            file_viewer.set_position(tauri::Position::Physical(tauri::PhysicalPosition {
+                                x: position.x + main_size.width as i32,
+                                y: position.y,
+                            }))?;
+                        }
+                    }
+                }
+            } else if window.label() == "file-viewer" {
+                let app_handle = window.app_handle();
+                if let Some(main_window) = app_handle.get_window("main") {
+                    if let Ok(file_viewer_pos) = window.outer_position() {
+                        if let Ok(main_size) = main_window.outer_size() {
+                            let new_main_x = file_viewer_pos.x - main_size.width as i32;
+                            main_window.set_position(tauri::Position::Physical(tauri::PhysicalPosition {
+                                x: new_main_x,
+                                y: position.y,
+                            }))?;
+                        }
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 fn main() {
     tauri::Builder::default()
         .manage(FSWatcher(Mutex::new(None)))
         .manage(Mutex::new(ResizeState::default()))
+        .manage(MemoryMonitor::default())
         .on_window_event(|event| {
-            match event.event() {
-                WindowEvent::CloseRequested { api, .. } => {
-                    if event.window().label() == "file-viewer" {
-                        let app_handle = event.window().app_handle();
-                        if let Err(e) = app_handle.emit_all("file-viewer-closed", ()) {
-                            eprintln!("Error emitting close event: {:?}", e);
-                        }
-                        if let Err(e) = event.window().hide() {
-                            eprintln!("Error hiding window: {:?}", e);
-                        }
-                        api.prevent_close();
-                    }
-                }
-
-                WindowEvent::Focused(focused) => {
-                    if *focused {
-                        let window = event.window();
-                        let app_handle = window.app_handle();
-                        
-                        if window.label() == "main" {
-                            if let Some(file_viewer) = app_handle.get_window("file-viewer") {
-                                if matches!(file_viewer.is_visible(), Ok(true)) {
-                                    // Force both windows to front
-                                    let _ = window.set_always_on_top(true);
-                                    let _ = file_viewer.set_always_on_top(true);
-                                    let _ = file_viewer.unminimize();
-                                    let _ = window.set_always_on_top(false);
-                                    let _ = file_viewer.set_always_on_top(false);
-                                }
-                            }
-                        } else if window.label() == "file-viewer" {
-                            if let Some(main_window) = app_handle.get_window("main") {
-                                // Force both windows to front
-                                let _ = window.set_always_on_top(true);
-                                let _ = main_window.set_always_on_top(true);
-                                let _ = main_window.unminimize();
-                                let _ = window.set_always_on_top(false);
-                                let _ = main_window.set_always_on_top(false);
-                            }
-                        }
-                    }
-                }
-
-                WindowEvent::Moved(position) => {
-                    if event.window().label() == "main" {
-                        let app_handle = event.window().app_handle();
-                        if let Some(file_viewer) = app_handle.get_window("file-viewer") {
-                            if matches!(file_viewer.is_visible(), Ok(true)) {
-                                if let Ok(main_size) = event.window().outer_size() {
-                                    let _ = file_viewer.set_position(tauri::Position::Physical(tauri::PhysicalPosition {
-                                        x: position.x + main_size.width as i32,
-                                        y: position.y,
-                                    }));
-                                }
-                            }
-                        }
-                    } else if event.window().label() == "file-viewer" {
-                        let app_handle = event.window().app_handle();
-                        if let Some(main_window) = app_handle.get_window("main") {
-                            if let Ok(file_viewer_pos) = event.window().outer_position() {
-                                if let Ok(main_size) = main_window.outer_size() {
-                                    let new_main_x = file_viewer_pos.x - main_size.width as i32;
-                                    let _ = main_window.set_position(tauri::Position::Physical(tauri::PhysicalPosition {
-                                        x: new_main_x,
-                                        y: position.y,
-                                    }));
-                                }
-                            }
-                        }
-                    }
-                }
-                _ => {}
+            if let Err(e) = handle_window_event(event.event(), event.window()) {
+                eprintln!("Error handling window event: {:?}", e);
             }
         })
         .invoke_handler(tauri::generate_handler![
