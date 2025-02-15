@@ -7,15 +7,36 @@ use std::{fs, path::{Path, PathBuf}};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::collections::HashSet;
 use tauri::{command, api::dialog, Manager, WindowEvent};
-use notify::{Watcher, RecursiveMode, Event};
+use notify::{Watcher, RecursiveMode, EventKind};
+use std::sync::Arc;
 
+// Constants
 const MAX_FILE_SIZE: u64 = 10 * 1024 * 1024; // 10MB limit
-const DEBOUNCE_TIME: u64 = 100; // 100ms
-const MAX_WATCH_DEPTH: u32 = 5;
-const CHUNK_SIZE: usize = 1_000_000; // 1MB chunks for file streaming
+const DEBOUNCE_TIME: u64 = 500; // 500ms debounce time
+const MAX_DEPTH: u32 = 3; // Reduced max depth
+const BATCH_SIZE: usize = 50; // Batch size for processing
+const CHUNK_SIZE: usize = 500 * 1024; // 500KB chunks for streaming
+const CLEANUP_INTERVAL: u64 = 300; // 5 minutes
+const MEMORY_LIMIT: u64 = 512 * 1024 * 1024; // 512MB limit
 
-// Resize state management
+// File watcher state
+struct FileWatchState {
+    last_event: AtomicU64,
+    watched_paths: Mutex<HashSet<String>>,
+}
+
+impl Default for FileWatchState {
+    fn default() -> Self {
+        Self {
+            last_event: AtomicU64::new(0),
+            watched_paths: Mutex::new(HashSet::new()),
+        }
+    }
+}
+
+// State management
 struct ResizeState {
     last_resize: Instant,
     is_resizing: AtomicBool,
@@ -30,16 +51,7 @@ impl Default for ResizeState {
     }
 }
 
-#[derive(serde::Serialize)]
-struct FileInfo {
-    name: String,
-    path: String,
-    is_directory: bool,
-    children: Option<Vec<FileInfo>>
-}
-
-struct FSWatcher(Mutex<Option<notify::RecommendedWatcher>>);
-
+// Memory monitoring
 struct MemoryMonitor {
     last_cleanup: AtomicU64,
     total_allocated: AtomicU64,
@@ -62,7 +74,7 @@ impl MemoryMonitor {
             .as_secs();
         
         let last = self.last_cleanup.load(Ordering::Relaxed);
-        if now - last > 300 { // Cleanup every 5 minutes
+        if now - last > CLEANUP_INTERVAL {
             self.total_allocated.store(0, Ordering::Relaxed);
             self.last_cleanup.store(now, Ordering::Relaxed);
         }
@@ -71,7 +83,7 @@ impl MemoryMonitor {
 
     fn allocate(&self, size: u64) -> Result<(), String> {
         let current = self.total_allocated.load(Ordering::Relaxed);
-        if current + size > 1024 * 1024 * 1024 { // 1GB limit
+        if current + size > MEMORY_LIMIT {
             return Err("Memory limit exceeded".to_string());
         }
         self.total_allocated.fetch_add(size, Ordering::Relaxed);
@@ -79,7 +91,15 @@ impl MemoryMonitor {
     }
 }
 
-// File Reading and Directory Functions
+#[derive(serde::Serialize)]
+struct FileInfo {
+    name: String,
+    path: String,
+    is_directory: bool,
+    children: Option<Vec<FileInfo>>
+}
+
+// File functions
 #[command]
 async fn read_file(path: String) -> Result<String, String> {
     let metadata = fs::metadata(&path).map_err(|e| e.to_string())?;
@@ -98,54 +118,131 @@ async fn select_folder() -> Result<String, String> {
 }
 
 #[command]
-fn list_files(path: String) -> Result<Vec<FileInfo>, String> {
-    read_dir_recursive(Path::new(&path), 0)
+fn list_files(path: String, depth: Option<u32>) -> Result<Vec<FileInfo>, String> {
+    read_dir_recursive(Path::new(&path), depth.unwrap_or(0), 0)
 }
 
-fn read_dir_recursive(path: &Path, depth: u32) -> Result<Vec<FileInfo>, String> {
-    if depth > MAX_WATCH_DEPTH {
+fn read_dir_recursive(path: &Path, max_depth: u32, current_depth: u32) -> Result<Vec<FileInfo>, String> {
+    if current_depth > max_depth || current_depth > MAX_DEPTH {
         return Ok(Vec::new());
     }
 
-    let entries = fs::read_dir(path).map_err(|e| e.to_string())?;
-    let mut directories: Vec<FileInfo> = Vec::new();
-    let mut files: Vec<FileInfo> = Vec::new();
+    let mut result = Vec::new();
+    let entries: Vec<_> = fs::read_dir(path)
+        .map_err(|e| e.to_string())?
+        .filter_map(Result::ok)
+        .collect();
 
-    for entry in entries.filter_map(Result::ok) {
-        let file_type = entry.file_type().map_err(|e| e.to_string())?;
-        let path_buf = entry.path();
-        let name = path_buf.file_name()
-            .ok_or("Invalid filename")?
-            .to_string_lossy()
-            .into_owned();
+    for chunk in entries.chunks(BATCH_SIZE) {
+        let chunk_len = chunk.len();
+        for entry in chunk.iter() {
+            let file_type = entry.file_type().map_err(|e| e.to_string())?;
+            let path_buf = entry.path();
+            let name = path_buf.file_name()
+                .ok_or("Invalid filename")?
+                .to_string_lossy()
+                .into_owned();
 
-        if file_type.is_dir() {
-            directories.push(FileInfo {
-                name,
-                path: path_buf.to_string_lossy().into_owned(),
-                is_directory: true,
-                children: Some(read_dir_recursive(&path_buf, depth + 1)?)
-            });
-        } else {
-            files.push(FileInfo {
-                name,
-                path: path_buf.to_string_lossy().into_owned(),
-                is_directory: false,
-                children: None
-            });
+            if file_type.is_dir() {
+                let children = if current_depth < max_depth {
+                    Some(read_dir_recursive(&path_buf, max_depth, current_depth + 1)?)
+                } else {
+                    None
+                };
+
+                result.push(FileInfo {
+                    name,
+                    path: path_buf.to_string_lossy().into_owned(),
+                    is_directory: true,
+                    children
+                });
+            } else {
+                result.push(FileInfo {
+                    name,
+                    path: path_buf.to_string_lossy().into_owned(),
+                    is_directory: false,
+                    children: None
+                });
+            }
+        }
+        
+        if chunk_len == BATCH_SIZE {
+            std::thread::sleep(Duration::from_millis(1));
         }
     }
 
-    directories.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
-    files.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
-
-    let mut result = Vec::with_capacity(directories.len() + files.len());
-    result.extend(directories);
-    result.extend(files);
+    result.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
     Ok(result)
 }
 
-// Explorer Integration Functions
+// File watcher
+#[command]
+async fn watch_directory(path: String, window: tauri::Window) -> Result<(), String> {
+    let watch_state = window.state::<FileWatchState>();
+    
+    // Clean up previous watches
+    {
+        let mut paths = watch_state.watched_paths.lock().map_err(|e| e.to_string())?;
+        paths.clear();
+        paths.insert(path.clone());
+    }
+
+    let window = window.clone();
+    
+    struct EventHandlerImpl {
+        window: tauri::Window,
+        last_event: Arc<AtomicU64>,
+    }
+
+    let last_event = Arc::new(AtomicU64::new(0));
+    let handler = EventHandlerImpl {
+        window,
+        last_event: last_event.clone(),
+    };
+
+    let mut watcher = notify::recommended_watcher(move |res: Result<notify::Event, notify::Error>| {
+        if let Ok(event) = res {
+            let event_type = match event.kind {
+                notify::EventKind::Create(_) => Some("fs-created"),
+                notify::EventKind::Remove(_) => Some("fs-deleted"),
+                notify::EventKind::Modify(k) => match k {
+                    notify::event::ModifyKind::Data(_) => Some("fs-modified"),
+                    _ => None,
+                },
+                _ => None,
+            };
+
+            if let Some(event_type) = event_type {
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64;
+                
+                let last = handler.last_event.load(Ordering::Relaxed);
+                if now - last < DEBOUNCE_TIME {
+                    return;
+                }
+                
+                handler.last_event.store(now, Ordering::Relaxed);
+                let _ = handler.window.emit(event_type, ());
+            }
+        }
+    }).map_err(|e| e.to_string())?;
+
+    watcher.watch(path.as_ref(), RecursiveMode::Recursive)
+        .map_err(|e| e.to_string())?;
+
+    Ok(())
+}
+#[command]
+async fn stop_watching(window: tauri::Window) -> Result<(), String> {
+    let watch_state = window.state::<FileWatchState>();
+    let mut paths = watch_state.watched_paths.lock().map_err(|e| e.to_string())?;
+    paths.clear();
+    Ok(())
+}
+
+// Explorer Integration
 #[command]
 async fn open_in_explorer(path: String) -> Result<(), String> {
     #[cfg(target_os = "windows")]
@@ -207,64 +304,7 @@ async fn open_in_explorer(path: String) -> Result<(), String> {
     Ok(())
 }
 
-// File Watcher Functions
-#[command]
-async fn watch_directory(path: String, window: tauri::Window) -> Result<(), String> {
-    let watcher_state = window.state::<FSWatcher>();
-    let mut watcher = watcher_state.0.lock().map_err(|e| e.to_string())?;
-
-    // Clean up old watcher
-    if watcher.is_some() {
-        *watcher = None;
-    }
-
-    let window_clone = window.clone();
-    let mut new_watcher = notify::recommended_watcher(move |res: Result<Event, notify::Error>| {
-        match res {
-            Ok(event) => {
-                let event_type = match event.kind {
-                    notify::EventKind::Create(_) => "fs-created",
-                    notify::EventKind::Modify(_) => "fs-modified",
-                    notify::EventKind::Remove(_) => "fs-deleted",
-                    _ => return,
-                };
-                
-                // Debounce events
-                static LAST_EVENT: AtomicU64 = AtomicU64::new(0);
-                let now = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap()
-                    .as_millis() as u64;
-                
-                let last = LAST_EVENT.load(Ordering::Relaxed);
-                if now - last < DEBOUNCE_TIME {
-                    return;
-                }
-                
-                LAST_EVENT.store(now, Ordering::Relaxed);
-                window_clone.emit(event_type, ()).ok();
-            }
-            Err(e) => eprintln!("Watch error: {:?}", e),
-        }
-    }).map_err(|e| e.to_string())?;
-
-    // Instead of using Config, we'll use watch() directly with RecursiveMode
-    new_watcher.watch(path.as_ref(), RecursiveMode::Recursive)
-        .map_err(|e| e.to_string())?;
-
-    *watcher = Some(new_watcher);
-    Ok(())
-}
-
-#[command]
-async fn stop_watching(window: tauri::Window) -> Result<(), String> {
-    let watcher_state = window.state::<FSWatcher>();
-    let mut watcher = watcher_state.0.lock().map_err(|e| e.to_string())?;
-    *watcher = None;
-    Ok(())
-}
-
-// History Functions
+// History management
 #[command]
 async fn write_history(path: String, content: String, window: tauri::Window) -> Result<(), String> {
     let memory_monitor = window.state::<MemoryMonitor>();
@@ -309,6 +349,7 @@ fn get_app_data_dir() -> Result<String, String> {
         .map(|path| path.to_string_lossy().into_owned())
 }
 
+// File viewer window management
 #[command]
 async fn create_file_window(
     window: tauri::Window, 
@@ -324,7 +365,6 @@ async fn create_file_window(
     }
 
     memory_monitor.allocate(content.len() as u64)?;
-    
     let app_handle = window.app_handle();
     
     let file_viewer = if let Some(file_viewer) = app_handle.get_window("file-viewer") {
@@ -346,9 +386,8 @@ async fn create_file_window(
         .map_err(|e| e.to_string())?
     };
 
-    let main_window = window;
-    let main_position = main_window.outer_position().map_err(|e| e.to_string())?;
-    let main_size = main_window.outer_size().map_err(|e| e.to_string())?;
+    let main_position = window.outer_position().map_err(|e| e.to_string())?;
+    let main_size = window.outer_size().map_err(|e| e.to_string())?;
     
     file_viewer.set_position(tauri::Position::Physical(tauri::PhysicalPosition {
         x: main_position.x + main_size.width as i32,
@@ -362,9 +401,11 @@ async fn create_file_window(
 
     file_viewer.show().map_err(|e| e.to_string())?;
     
+    // Stream content in chunks if large
     if content.len() > CHUNK_SIZE {
         for chunk in content.as_bytes().chunks(CHUNK_SIZE) {
             if let Ok(chunk_str) = String::from_utf8(chunk.to_vec()) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
                 file_viewer.emit("append-content", serde_json::json!({
                     "content": chunk_str,
                     "filePath": &title,
@@ -388,7 +429,8 @@ async fn list_history_files(path: String) -> Result<Vec<String>, String> {
     let app_dir = tauri::api::path::app_data_dir(&tauri::Config::default())
         .ok_or("Could not get app directory")?;
     let dir_path = app_dir.join(path);
-if !dir_path.exists() {
+    
+    if !dir_path.exists() {
         return Ok(vec![]);
     }
 
@@ -399,14 +441,25 @@ if !dir_path.exists() {
 
 fn list_json_files_recursive(dir: &PathBuf, files: &mut Vec<String>) -> Result<(), String> {
     if dir.is_dir() {
-        for entry in fs::read_dir(dir).map_err(|e| e.to_string())? {
-            let entry = entry.map_err(|e| e.to_string())?;
-            let path = entry.path();
+        let entries: Vec<_> = fs::read_dir(dir)
+            .map_err(|e| e.to_string())?
+            .filter_map(Result::ok)
+            .collect();
+
+        for chunk in entries.chunks(BATCH_SIZE) {
+            let chunk_len = chunk.len();
+            for entry in chunk.iter() {
+                let path = entry.path();
+                
+                if path.is_dir() {
+                    list_json_files_recursive(&path, files)?;
+                } else if path.extension().and_then(|ext| ext.to_str()) == Some("json") {
+                    files.push(path.to_string_lossy().into_owned());
+                }
+            }
             
-            if path.is_dir() {
-                list_json_files_recursive(&path, files)?;
-            } else if path.extension().and_then(|ext| ext.to_str()) == Some("json") {
-                files.push(path.to_string_lossy().into_owned());
+            if chunk_len == BATCH_SIZE {
+                std::thread::sleep(Duration::from_millis(1));
             }
         }
     }
@@ -417,8 +470,7 @@ fn handle_window_event(event: &WindowEvent, window: &tauri::Window) -> Result<()
     match event {
         WindowEvent::CloseRequested { api, .. } => {
             if window.label() == "file-viewer" {
-                let app_handle = window.app_handle();
-                app_handle.emit_all("file-viewer-closed", ())?;
+                window.emit_all("file-viewer-closed", ())?;
                 window.hide()?;
                 api.prevent_close();
             }
@@ -483,7 +535,7 @@ fn handle_window_event(event: &WindowEvent, window: &tauri::Window) -> Result<()
 
 fn main() {
     tauri::Builder::default()
-        .manage(FSWatcher(Mutex::new(None)))
+        .manage(FileWatchState::default())
         .manage(Mutex::new(ResizeState::default()))
         .manage(MemoryMonitor::default())
         .on_window_event(|event| {
