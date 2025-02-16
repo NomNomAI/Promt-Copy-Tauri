@@ -25,6 +25,7 @@ const App = () => {
     const [isSelectingFolder, setIsSelectingFolder] = useState(false);
     const [showToastSuccess, setShowToastSuccess] = useState(false);
     const promptTextareaRef = useRef<HTMLTextAreaElement>(null);
+    const [activeContextMenu, setActiveContextMenu] = useState<string | null>(null);
 
     interface FileInfo {
     name: string;
@@ -441,50 +442,52 @@ const App = () => {
                                     />
                                 ) : (
                                     activeTab.filteredFiles.map((file) => (
-                                        <FileTreeItem
-                                            key={file.path}
-                                            file={file}
-                                            checkedFiles={activeTab.checkedFiles}
-                                            setCheckedFiles={(newChecked) => updateActiveTab({ checkedFiles: newChecked })}
-                                            expandedFolders={activeTab.expandedFolders}
-                                            setExpandedFolders={(newExpanded) => updateActiveTab({ expandedFolders: newExpanded })}
-                                            themeColors={themeColors}
-                                            onExpandFolder={async (path) => {
-                                                try {
-                                                    const children = await invoke<FileInfo[]>('list_files', {
-                                                        path,
-                                                        depth: 1
-                                                    });
+                                        < FileTreeItem
+    key = { file.path }
+    file = { file }
+    checkedFiles = { activeTab.checkedFiles }
+    setCheckedFiles = {(newChecked) => updateActiveTab({checkedFiles: newChecked })}
+                                    expandedFolders={activeTab.expandedFolders}
+                                    setExpandedFolders={(newExpanded) => updateActiveTab({ expandedFolders: newExpanded })}
+                                    themeColors={themeColors}
+                                    onExpandFolder={async (path) => {
+                                        try {
+                                            const children = await invoke<FileInfo[]>('list_files', {
+                                                path,
+                                                depth: 1
+                                            });
 
-                                                    setTabs(prevTabs =>
-                                                        prevTabs.map(tab => {
-                                                            if (tab.id === activeTabId) {
-                                                                const updateChildren = (files: FileInfo[]): FileInfo[] => {
-                                                                    return files.map(file => {
-                                                                        if (file.path === path) {
-                                                                            return { ...file, children };
-                                                                        } else if (file.is_directory && file.children) {
-                                                                            return { ...file, children: updateChildren(file.children) };
-                                                                        }
-                                                                        return file;
-                                                                    });
-                                                                };
-                                                                return {
-                                                                    ...tab,
-                                                                    files: updateChildren(tab.files)
-                                                                };
-                                                            }
-                                                            return tab;
-                                                        })
-                                                    );
-                                                } catch (err) {
-                                                    console.error('Failed to load folder contents:', err);
-                                                }
-                                            }}
-                                            loadingFolders={new Set()}
-                                            level={0}
-                                            searchQuery={activeTab.searchQuery}
-                                        />
+                                            setTabs(prevTabs =>
+                                                prevTabs.map(tab => {
+                                                    if (tab.id === activeTabId) {
+                                                        const updateChildren = (files: FileInfo[]): FileInfo[] => {
+                                                            return files.map(file => {
+                                                                if (file.path === path) {
+                                                                    return { ...file, children };
+                                                                } else if (file.is_directory && file.children) {
+                                                                    return { ...file, children: updateChildren(file.children) };
+                                                                }
+                                                                return file;
+                                                            });
+                                                        };
+                                                        return {
+                                                            ...tab,
+                                                            files: updateChildren(tab.files)
+                                                        };
+                                                    }
+                                                    return tab;
+                                                })
+                                            );
+                                        } catch (err) {
+                                            console.error('Failed to load folder contents:', err);
+                                        }
+                                    }}
+                                    loadingFolders={new Set()}
+                                    level={0}
+                                    searchQuery={activeTab.searchQuery}
+                                    activeContextMenu={activeContextMenu}
+                                    setActiveContextMenu={setActiveContextMenu}
+/>
                                     ))
                                 )}
                             </div>

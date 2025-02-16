@@ -21,6 +21,8 @@ interface FileTreeItemProps {
     loadingFolders: Set<string>;
     level: number;
     searchQuery: string;
+    activeContextMenu: string | null;
+    setActiveContextMenu: (path: string | null) => void;
 }
 
 interface ContextMenuProps {
@@ -85,10 +87,13 @@ const FileTreeItem: React.FC<FileTreeItemProps> = ({
     onExpandFolder,
     loadingFolders,
     level,
-    searchQuery
+    searchQuery,
+    activeContextMenu,
+    setActiveContextMenu
 }) => {
-    const [contextMenu, setContextMenu] = useState<{ x: number; y: number } | null>(null);
+    const [menuPosition, setMenuPosition] = useState<{ x: number; y: number } | null>(null);
     const isLoading = loadingFolders.has(file.path);
+    const isContextMenuOpen = activeContextMenu === file.path;
 
     const toggleFolder = async (path: string) => {
         if (level >= MAX_DEPTH) {
@@ -108,10 +113,13 @@ const FileTreeItem: React.FC<FileTreeItemProps> = ({
 
     const handleContextMenu = (e: React.MouseEvent) => {
         e.preventDefault();
-        setContextMenu({
-            x: e.clientX,
-            y: e.clientY
-        });
+        setMenuPosition({ x: e.clientX, y: e.clientY });
+        setActiveContextMenu(file.path);
+    };
+
+    const closeContextMenu = () => {
+        setMenuPosition(null);
+        setActiveContextMenu(null);
     };
 
     return (
@@ -200,6 +208,8 @@ const FileTreeItem: React.FC<FileTreeItemProps> = ({
                                 loadingFolders={loadingFolders}
                                 level={level + 1}
                                 searchQuery={searchQuery}
+                                activeContextMenu={activeContextMenu}
+                                setActiveContextMenu={setActiveContextMenu}
                             />
                         ))}
                         {file.children.length > ITEMS_PER_PAGE && (
@@ -210,12 +220,12 @@ const FileTreeItem: React.FC<FileTreeItemProps> = ({
                     </div>
                 )}
             </div>
-            {contextMenu && (
+            {isContextMenuOpen && menuPosition && (
                 <ContextMenu
-                    x={contextMenu.x}
-                    y={contextMenu.y}
+                    x={menuPosition.x}
+                    y={menuPosition.y}
                     file={file}
-                    onClose={() => setContextMenu(null)}
+                    onClose={closeContextMenu}
                     themeColors={themeColors}
                 />
             )}
